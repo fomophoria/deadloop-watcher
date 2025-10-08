@@ -1,0 +1,19 @@
+{
+    "name": "deadloop-watcher",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "start": "ts-node --transpile-only src/worker.ts",
+        "generate": "prisma generate"
+    },
+    "dependencies": {
+        "@prisma/client": "5.19.1",
+        "dotenv": "^16.4.5",
+        "ethers": "^6.15.0",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.5.4"
+    },
+    "devDependencies": {
+        "prisma": "5.19.1"
+    }
+}
