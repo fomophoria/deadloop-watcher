@@ -43,7 +43,7 @@ assertAddress("DEAD_ADDRESS", DEAD_ADDRESS);
 const ZERO = "0x0000000000000000000000000000000000000000";
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Globals (filled when running)                                             */
+/* Globals                                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 const prisma = new PrismaClient();
@@ -64,17 +64,20 @@ const toHuman = (raw: bigint) => Number(ethers.formatUnits(raw, TOKEN_DECIMALS))
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Resilient WS (auto-reconnect backoff)                                     */
+/* WebSocket Provider (auto-reconnect)                                       */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 function createWsProvider() {
     const ws = new ethers.WebSocketProvider(RPC_WSS);
     ws.on("error", (e) => console.error("WS error:", e));
-    ws.on("close", (code) => console.warn("WS closed:", code));
+    // ❌ no ws.on("close") — ethers v6 doesn't support it
+    ws.on("disconnect", async (err) => {
+        console.warn("WS disconnected:", err);
+        await reconnectWs();
+    });
     return ws;
 }
 
-/** Reconnect with exponential backoff and rebind tokenRead */
 async function reconnectWs(maxDelayMs = 15000) {
     let delay = 1000;
     while (true) {
@@ -83,9 +86,9 @@ async function reconnectWs(maxDelayMs = 15000) {
             wsProvider?.destroy?.();
             wsProvider = createWsProvider();
             tokenRead = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, wsProvider);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            await (wsProvider as any)._waitUntilReady?.();
+            // ethers v6 auto-connects, so no need for _waitUntilReady
             console.log("✅ WS reconnected");
+            bindTransferListener();
             break;
         } catch (e) {
             console.warn(`WS reconnect failed, retrying in ${delay} ms`, e);
@@ -96,7 +99,7 @@ async function reconnectWs(maxDelayMs = 15000) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Core burn logic                                                           */
+/* Burn logic                                                                */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 async function burnAmount(from: string, value: bigint) {
@@ -106,16 +109,12 @@ async function burnAmount(from: string, value: bigint) {
         return;
     }
 
-    // Debounce in case multiple transfers hit at once
     await sleep(DELAY_MS_AFTER_EVENT);
 
-    // Submit burn (transfer to dead)
     const tx = await tokenWrite.transfer(DEAD_ADDRESS, value);
     console.log(`🔥 Burn submitted: ${human} tokens → ${DEAD_ADDRESS} | tx=${tx.hash}`);
-
     const receipt = await tx.wait();
 
-    // Persist in DB (matches your schema)
     await prisma.burn.create({
         data: {
             txHash: receipt.transactionHash,
@@ -124,9 +123,6 @@ async function burnAmount(from: string, value: bigint) {
             tokenAddress: TOKEN_ADDRESS,
             amountRaw: value.toString(),
             amountHuman: human
-            // timestamp uses DB default now()
-            // or fetch block time:
-            // timestamp: new Date((await httpProvider.getBlock(receipt.blockNumber))!.timestamp * 1000),
         }
     });
 
@@ -134,36 +130,28 @@ async function burnAmount(from: string, value: bigint) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Event wiring                                                              */
+/* Event listener                                                            */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 function bindTransferListener() {
-    tokenRead.on(
-        "Transfer",
-        async (from: string, to: string, value: bigint) => {
-            try {
-                if (to.toLowerCase() !== REWARD_RECIPIENT) return;
-
-                const human = toHuman(value);
-                console.log(`🪙 Incoming: ${human} tokens from ${from} → ${REWARD_RECIPIENT}`);
-
-                await burnAmount(from, value);
-            } catch (e) {
-                console.error("Transfer handler error:", e);
-            }
+    tokenRead.on("Transfer", async (from: string, to: string, value: bigint) => {
+        try {
+            if (to.toLowerCase() !== REWARD_RECIPIENT) return;
+            const human = toHuman(value);
+            console.log(`🪙 Incoming: ${human} tokens from ${from} → ${REWARD_RECIPIENT}`);
+            await burnAmount(from, value);
+        } catch (e) {
+            console.error("Transfer handler error:", e);
         }
-    );
+    });
 
-    // Re-bind on provider errors/close
     wsProvider.on("error", async (e) => {
         console.error("WS provider error:", e);
         await reconnectWs();
-        bindTransferListener();
     });
-    wsProvider.on("close", async () => {
-        console.warn("WS provider closed");
+    wsProvider.on("disconnect", async (e) => {
+        console.warn("WS provider disconnected:", e);
         await reconnectWs();
-        bindTransferListener();
     });
 }
 
@@ -191,7 +179,6 @@ async function startupSweep() {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 async function main() {
-    // Initialize providers/contracts only when actually running
     httpProvider = new ethers.JsonRpcProvider(RPC_HTTP);
     signer = new ethers.Wallet(PRIVATE_KEY, httpProvider);
     wsProvider = createWsProvider();
@@ -202,13 +189,10 @@ async function main() {
     console.log(`Token: ${TOKEN_ADDRESS}`);
     console.log(`Listening for transfers to: ${REWARD_RECIPIENT}`);
 
-    // Sanity check on chain decimals vs env
     try {
         const chainDecimals: number = await tokenWrite.decimals();
         if (chainDecimals !== TOKEN_DECIMALS) {
-            console.warn(
-                `NOTE: TOKEN_DECIMALS=${TOKEN_DECIMALS} but contract decimals=${chainDecimals}.`
-            );
+            console.warn(`NOTE: TOKEN_DECIMALS=${TOKEN_DECIMALS} but contract decimals=${chainDecimals}.`);
         }
     } catch (e) {
         console.warn("Could not read token decimals (continuing):", e);
@@ -216,9 +200,7 @@ async function main() {
 
     bindTransferListener();
 
-    if (STARTUP_SWEEP) {
-        await startupSweep();
-    }
+    if (STARTUP_SWEEP) await startupSweep();
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -227,8 +209,6 @@ async function main() {
 
 if (TOKEN_ADDRESS.toLowerCase() === ZERO) {
     console.log("⏸️  TOKEN_ADDRESS is zero address. Watcher is idling until launch.");
-    console.log("    Set TOKEN_ADDRESS to your deployed token and redeploy the watcher.");
-    // light heartbeat so you can see it's alive
     setInterval(() => console.log("⏳ waiting for launch…"), 60_000);
 } else {
     main().catch((e) => {
@@ -249,6 +229,7 @@ process.on("SIGINT", async () => {
         process.exit(0);
     }
 });
+
 process.on("SIGTERM", async () => {
     console.log("Shutting down…");
     try {
