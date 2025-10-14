@@ -3,8 +3,12 @@
     "private": true,
     "type": "module",
     "scripts": {
+        "prestart": "prisma migrate deploy && prisma generate",
         "start": "ts-node --transpile-only src/worker.ts",
-        "generate": "prisma generate"
+        "generate": "prisma generate",
+        "migrate:dev": "prisma migrate dev --name init --schema=./prisma/schema.prisma",
+        "migrate:deploy": "prisma migrate deploy --schema=./prisma/schema.prisma",
+        "lint": "tsc --noEmit"
     },
     "dependencies": {
         "@prisma/client": "5.19.1",
