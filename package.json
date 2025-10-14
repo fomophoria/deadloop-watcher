@@ -3,11 +3,8 @@
     "private": true,
     "type": "module",
     "scripts": {
-        // 👇 Use this for fresh DB initialization ONCE (creates tables from schema)
         "prestart": "prisma db push && prisma generate",
-        // 👇 Normal runtime
         "start": "ts-node --transpile-only src/worker.ts",
-        // 👇 Handy dev utilities
         "generate": "prisma generate",
         "migrate:dev": "prisma migrate dev --name init --schema=./prisma/schema.prisma",
         "migrate:deploy": "prisma migrate deploy --schema=./prisma/schema.prisma",
