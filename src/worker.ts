@@ -51,7 +51,7 @@ const ERC20_ABI = [
     "event Transfer(address indexed from, address indexed to, uint256 value)",
     "function transfer(address to, uint256 value) returns (bool)",
     "function balanceOf(address owner) view returns (uint256)",
-    "function decimals() view returns (uint8)"
+    "function decimals() view returns (uint8)",
 ];
 
 let httpProvider: ethers.JsonRpcProvider;
@@ -64,7 +64,7 @@ const toHuman = (raw: bigint) => Number(ethers.formatUnits(raw, TOKEN_DECIMALS))
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* WebSocket Provider (simple reconnect + health check)                      */
+/* WebSocket Provider (reconnect + health check)                             */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 function createWsProvider() {
@@ -121,18 +121,24 @@ async function burnAmount(from: string, value: bigint) {
     console.log(`🔥 Burn submitted: ${human} tokens → ${DEAD_ADDRESS} | tx=${tx.hash}`);
     const receipt = await tx.wait();
 
+    const txHash = tx.hash || receipt?.transactionHash;
+    if (!txHash) {
+        console.warn("⚠️ No txHash found for burn — skipping DB insert.");
+        return;
+    }
+
     await prisma.burn.create({
         data: {
-            txHash: receipt.transactionHash,
+            txHash,
             fromAddress: from,
             toAddress: DEAD_ADDRESS,
             tokenAddress: TOKEN_ADDRESS,
             amountRaw: value.toString(),
-            amountHuman: human
-        }
+            amountHuman: human,
+        },
     });
 
-    console.log(`✅ Logged burn: ${human} tokens | tx=${receipt.transactionHash}`);
+    console.log(`✅ Logged burn: ${human} tokens | tx=${txHash}`);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
