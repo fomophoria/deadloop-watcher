@@ -64,17 +64,12 @@ const toHuman = (raw: bigint) => Number(ethers.formatUnits(raw, TOKEN_DECIMALS))
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* WebSocket Provider (auto-reconnect)                                       */
+/* WebSocket Provider (simple reconnect + health check)                      */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 function createWsProvider() {
     const ws = new ethers.WebSocketProvider(RPC_WSS);
-    ws.on("error", (e) => console.error("WS error:", e));
-    // ❌ no ws.on("close") — ethers v6 doesn't support it
-    ws.on("disconnect", async (err) => {
-        console.warn("WS disconnected:", err);
-        await reconnectWs();
-    });
+    ws.on("error", (e) => console.error("⚠️ WS error:", e));
     return ws;
 }
 
@@ -86,7 +81,6 @@ async function reconnectWs(maxDelayMs = 15000) {
             wsProvider?.destroy?.();
             wsProvider = createWsProvider();
             tokenRead = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, wsProvider);
-            // ethers v6 auto-connects, so no need for _waitUntilReady
             console.log("✅ WS reconnected");
             bindTransferListener();
             break;
@@ -96,6 +90,18 @@ async function reconnectWs(maxDelayMs = 15000) {
             delay = Math.min(maxDelayMs, delay * 2);
         }
     }
+}
+
+/** Periodically verify WS health (every 30s) */
+function startWsHealthCheck() {
+    setInterval(async () => {
+        try {
+            await wsProvider._detectNetwork();
+        } catch {
+            console.warn("🧩 WS health check failed, reconnecting...");
+            await reconnectWs();
+        }
+    }, 30000);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -134,6 +140,7 @@ async function burnAmount(from: string, value: bigint) {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 function bindTransferListener() {
+    tokenRead.removeAllListeners();
     tokenRead.on("Transfer", async (from: string, to: string, value: bigint) => {
         try {
             if (to.toLowerCase() !== REWARD_RECIPIENT) return;
@@ -143,15 +150,6 @@ function bindTransferListener() {
         } catch (e) {
             console.error("Transfer handler error:", e);
         }
-    });
-
-    wsProvider.on("error", async (e) => {
-        console.error("WS provider error:", e);
-        await reconnectWs();
-    });
-    wsProvider.on("disconnect", async (e) => {
-        console.warn("WS provider disconnected:", e);
-        await reconnectWs();
     });
 }
 
@@ -199,12 +197,13 @@ async function main() {
     }
 
     bindTransferListener();
+    startWsHealthCheck();
 
     if (STARTUP_SWEEP) await startupSweep();
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Launch-safe idle when TOKEN_ADDRESS is zero                               */
+/* Launch-safe idle                                                          */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 if (TOKEN_ADDRESS.toLowerCase() === ZERO) {
