@@ -6,7 +6,7 @@
 
 import "dotenv/config";
 import { ethers } from "ethers";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
@@ -19,16 +19,20 @@ const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS ?? "18");
 
 // --- PROVIDER / CONTRACT ---
 const provider = new ethers.JsonRpcProvider(RPC_HTTP);
-const token = new ethers.Contract(
-    TOKEN_ADDRESS,
-    ["event Transfer(address indexed from, address indexed to, uint256 value)"],
-    provider
-);
+const abi = ["event Transfer(address indexed from, address indexed to, uint256 value)"];
+const iface = new ethers.Interface(abi);
 
 // Start at token deployment block (you said 36,841,703)
 const START_BLOCK = 36841703;
 // Alchemy free plan: 10-block eth_getLogs limit
 const STEP = 10;
+
+// Build a narrow topics filter so the node returns only relevant logs
+const burnTopics = [
+    ethers.id("Transfer(address,address,uint256)"),
+    ethers.zeroPadValue(REWARD_RECIPIENT, 32), // indexed "from"
+    ethers.zeroPadValue(DEAD_ADDRESS, 32),     // indexed "to"
+];
 
 async function main() {
     console.log("Fetching historical burns…");
@@ -37,70 +41,68 @@ async function main() {
         `Scanning Transfer(from=${REWARD_RECIPIENT}, to=${DEAD_ADDRESS}) from block ${START_BLOCK} to ${latestBlock}`
     );
 
-    // Ethers v6: build an indexed filter to only fetch matching from/to
-    // This dramatically reduces logs returned.
-    const burnFilter = {
-        address: TOKEN_ADDRESS,
-        topics: [
-            ethers.id("Transfer(address,address,uint256)"),
-            ethers.zeroPadValue(REWARD_RECIPIENT, 32), // indexed "from"
-            ethers.zeroPadValue(DEAD_ADDRESS, 32),     // indexed "to"
-        ],
-    };
-
     let burnCount = 0;
-    let totalHuman = 0;
+    let totalHuman = new Prisma.Decimal(0);
 
     for (let fromBlock = START_BLOCK; fromBlock <= latestBlock; fromBlock += STEP) {
         const toBlock = Math.min(fromBlock + STEP - 1, latestBlock);
 
         try {
-            // Query only the logs matching from/to using provider.getLogs
-            const logs = await provider.getLogs({ ...burnFilter, fromBlock, toBlock });
+            const logs = await provider.getLogs({
+                address: TOKEN_ADDRESS,
+                topics: burnTopics,
+                fromBlock,
+                toBlock,
+            });
 
             if (logs.length > 0) {
                 console.log(`📦 ${logs.length} burn logs from blocks ${fromBlock}–${toBlock}`);
             }
 
             for (const l of logs) {
-                // Parse the log with the contract interface to extract args
-                const parsed = token.interface.parseLog({ topics: l.topics, data: l.data });
-                const { from, to, value } = parsed.args as unknown as {
-                    from: string;
-                    to: string;
-                    value: bigint;
-                };
+                // parseLog can throw or be incompatible at type-level; protect it.
+                let parsed: ReturnType<typeof iface.parseLog> | null = null;
+                try {
+                    parsed = iface.parseLog({ topics: l.topics, data: l.data });
+                } catch {
+                    // Not a matching log; skip defensively
+                    continue;
+                }
+                if (!parsed) continue;
 
-                const txHash = l.transactionHash;
-                const fromLc = from.toLowerCase();
-                const toLc = to.toLowerCase();
+                const args = parsed.args as unknown as { from: string; to: string; value: bigint };
+                const from = args.from.toLowerCase();
+                const to = args.to.toLowerCase();
+                const value = args.value;
 
-                // Double-check (defensive) the from/to pair matches what we expect
-                if (fromLc !== REWARD_RECIPIENT || toLc !== DEAD_ADDRESS) continue;
+                // Double-check the pair (defensive)
+                if (from !== REWARD_RECIPIENT || to !== DEAD_ADDRESS) continue;
 
-                const amountHuman = Number(ethers.formatUnits(value, TOKEN_DECIMALS));
+                const humanStr = ethers.formatUnits(value, TOKEN_DECIMALS); // string
+                const amountHuman = new Prisma.Decimal(humanStr);
+
                 burnCount += 1;
-                totalHuman += amountHuman;
+                totalHuman = totalHuman.add(amountHuman);
 
                 console.log(
-                    `🔥 Burn found: ${amountHuman} tokens — ${fromLc} → ${toLc} | tx=${txHash}`
+                    `🔥 Burn found: ${humanStr} tokens — ${from} → ${to} | tx=${l.transactionHash}`
                 );
 
                 await prisma.burn.upsert({
-                    where: { txHash },
+                    where: { txHash: l.transactionHash },
                     update: {},
                     create: {
-                        txHash,
-                        fromAddress: fromLc,
-                        toAddress: toLc,
+                        txHash: l.transactionHash,
+                        fromAddress: from,
+                        toAddress: to,
                         tokenAddress: TOKEN_ADDRESS,
                         amountRaw: value.toString(),
-                        amountHuman, // Prisma Decimal in schema; JS Number OK for typical human amounts
+                        amountHuman, // Decimal (exact)
                     },
                 });
             }
         } catch (err) {
-            const msg = (err as Error).message ?? String(err);
+            const msg = (err as Error)?.message ?? String(err);
             console.error(`⚠️  Error fetching ${fromBlock}–${toBlock}: ${msg}`);
             // brief cooldown to avoid provider throttling
             await new Promise((r) => setTimeout(r, 1000));
@@ -109,7 +111,7 @@ async function main() {
 
     console.log("Backfill complete ✅");
     console.log(`🔥 Total burns recorded: ${burnCount}`);
-    console.log(`💰 Total tokens burned: ${totalHuman.toLocaleString()} units`);
+    console.log(`💰 Total tokens burned: ${totalHuman.toString()} units`);
 
     await prisma.$disconnect();
 }
