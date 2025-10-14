@@ -16,14 +16,16 @@ datasource db {
 // ----------------------------
 // Models
 // ----------------------------
-
 model Burn {
   id           Int      @id @default(autoincrement())
-  txHash       String   @unique                      // Transaction hash on Base (Basescan link)
-  fromAddress  String                                // Source wallet
-  toAddress    String                                // Destination (burn/dead) wallet
-  amountRaw    String                                // Raw token units (for precision)
-  amountHuman  Float                                 // Human-readable (normalized) token amount
-  tokenAddress String                                // Token contract address (optional but good to store)
-  timestamp    DateTime @default(now())              // When burn happened
+  txHash       String   @unique                       // on-chain tx hash
+  fromAddress  String?                               // source wallet
+  toAddress    String?                               // destination (burn/dead) wallet
+  tokenAddress String?                               // token contract
+  amountRaw    String?                               // raw units (bigints as text)
+  amountHuman  Decimal?                              // exact human-readable amount
+  timestamp    DateTime @default(now())              // when burn happened
+
+  @@index([timestamp])
+  @@index([tokenAddress])
 }
