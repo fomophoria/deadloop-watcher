@@ -112,13 +112,12 @@ async function main() {
         }
     );
 
-    // If you want to observe low-level WS provider errors:
+    // ethers v6: valid events include "error", "block", "network", "poll", etc.
+    // "close" is NOT a ProviderEvent in v6.
     providerWs.on("error", (err) => {
         console.error("WebSocket provider error:", err);
     });
-    providerWs.on("close", () => {
-        console.warn("WebSocket provider closed");
-    });
+
 }
 
 main().catch(console.error);
