@@ -70,16 +70,71 @@ const contractWs = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, providerWs);
 /* Helpers                                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+function toHumanDecimal(raw: bigint): Prisma.Decimal {
+    return new Prisma.Decimal(raw.toString()).div(new Prisma.Decimal(10).pow(TOKEN_DECIMALS));
+}
+
+async function recordBurnRow(opts: {
+    txHash: string;
+    amount: bigint;
+    blockNumber?: number | null;
+}) {
+    const { txHash, amount, blockNumber } = opts;
+
+    // get a good timestamp (prefer block timestamp if available)
+    let timestamp = new Date();
+    if (blockNumber != null) {
+        const block = await providerHttp.getBlock(blockNumber);
+        if (block) timestamp = new Date(Number(block.timestamp) * 1000);
+    }
+
+    const amountHuman = toHumanDecimal(amount);
+
+    try {
+        // txHash is unique in your schema; upsert prevents duplicates if retried
+        await prisma.burn.upsert({
+            where: { txHash: txHash.toLowerCase() },
+            update: {},
+            create: {
+                txHash: txHash.toLowerCase(),
+                fromAddress: REWARD_RECIPIENT,              // already lowercased earlier
+                toAddress: DEAD_ADDRESS,                    // already lowercased earlier
+                tokenAddress: TOKEN_ADDRESS.toLowerCase(),
+                amountRaw: amount.toString(),
+                amountHuman,                                // Prisma.Decimal
+                timestamp,
+            },
+        });
+        console.log(`📝 Recorded burn row for tx=${txHash}`);
+    } catch (e) {
+        console.error("Failed to record burn row:", e);
+    }
+}
+
 async function burnBalance(reason: string) {
     const bal = (await contract.balanceOf(REWARD_RECIPIENT)) as bigint;
+
+    // Respect optional MIN_TOKEN_TO_ACT threshold if you use it
+    if (MIN_TOKEN_TO_ACT > 0 && Number(bal) / 10 ** TOKEN_DECIMALS < MIN_TOKEN_TO_ACT) {
+        console.log(
+            `🧹 ${reason}: balance ${Number(bal) / 10 ** TOKEN_DECIMALS} < MIN_TOKEN_TO_ACT=${MIN_TOKEN_TO_ACT} — skipping`
+        );
+        return;
+    }
+
     if (bal > 0n) {
         const human = Number(bal) / 10 ** TOKEN_DECIMALS;
         console.log(`🧹 ${reason}: burning ${human} tokens`);
-        // TS-safe call: contractSigner has transfer in ABI
+
+        // Send burn tx
         const tx = await contractSigner.transfer(DEAD_ADDRESS, bal);
         console.log(`→ TX: ${tx.hash}`);
+
         const rcpt = await tx.wait();
         console.log(`✅ Burned ${human} tokens in block ${rcpt?.blockNumber}`);
+
+        // Log to DB (so the dashboard sees it immediately)
+        await recordBurnRow({ txHash: tx.hash, amount: bal, blockNumber: rcpt?.blockNumber ?? null });
     } else {
         console.log(`🧹 ${reason}: no tokens to burn`);
     }
@@ -102,23 +157,19 @@ async function main() {
     // In ethers v6, listen with the contract instance bound to WS
     const filter = contractWs.filters.Transfer(null, REWARD_RECIPIENT);
 
-    contractWs.on(
-        filter,
-        async (from: string, to: string, value: bigint /*, event */) => {
-            const human = Number(value) / 10 ** TOKEN_DECIMALS;
-            console.log(`📥 Transfer detected: ${human} tokens from ${from}`);
-            await new Promise((r) => setTimeout(r, DELAY_MS_AFTER_EVENT));
-            await burnBalance("Event-triggered burn");
-        }
-    );
+    contractWs.on(filter, async (from: string, _to: string, value: bigint /*, event */) => {
+        const human = Number(value) / 10 ** TOKEN_DECIMALS;
+        console.log(`📥 Transfer detected: ${human} tokens from ${from}`);
+        await new Promise((r) => setTimeout(r, DELAY_MS_AFTER_EVENT));
+        await burnBalance("Event-triggered burn");
+    });
 
     // ethers v6: valid events include "error", "block", "network", "poll", etc.
-    // "close" is NOT a ProviderEvent in v6.
+    // (Do not add a 'close' handler; it's not a ProviderEvent in v6.)
     providerWs.on("error", (err) => {
         console.error("WebSocket provider error:", err);
     });
-
 }
 
 main().catch(console.error);
-// rebuild stamp 15/10/2025  9:56:37.92
+// build stamp
