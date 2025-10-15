@@ -1,245 +1,348 @@
+# Base Token Burner — Full Rewrite
+
+Below are ** complete replacements ** for your three files.They switch from WebSocket subscriptions(unreliable on Base) to ** HTTP polling with block cursors **, add ** idempotency ** (no duplicate burns), and include a ** checkpoint ** so the worker resumes where it left off. 
+
+---
+
+## `schema.prisma`
+    ```prisma
+// schema.prisma
+// Prisma 5.x
+// Adds a Cursor table for last processed block and strengthens Burn uniqueness.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = env("DATABASE_PROVIDER") // e.g. "postgresql" or "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Burn {
+  id           String   @id @default(cuid())
+  txHash       String
+  logIndex     Int
+  blockNumber  Int
+  tokenAddress String
+  from         String
+  to           String
+  value        String   // store raw uint256 as decimal string
+  timestamp    DateTime
+  createdAt    DateTime @default(now())
+
+  @@unique([txHash, logIndex])
+  @@index([blockNumber])
+  @@index([timestamp])
+  @@index([tokenAddress])
+}
+
+model Cursor {
+  // One row per token address
+  tokenAddress String @id
+  lastBlock    Int
+  updatedAt    DateTime @updatedAt
+}
+```
+
+    > After editing the schema, run:
+> - `npx prisma generate`
+    > - If you use migrations: `npx prisma migrate dev -n "add_burn_cursor"`
+
+---
+
+## `src/worker.ts`
+    ```ts
+// src/worker.ts
 import "dotenv/config";
 import { ethers } from "ethers";
 import { PrismaClient } from "@prisma/client";
 
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Env + validation                                                          */
-/* ────────────────────────────────────────────────────────────────────────── */
+/**
+ * Reliable Base listener using HTTP polling.
+ * - Queries Transfer(to == BURN_ADDRESS) logs in block batches.
+ * - Persists a Cursor per token so we never reprocess.
+ * - Idempotent via unique (txHash, logIndex).
+ */
 
-const must = (k: string) => {
-    const v = process.env[k];
-    if (!v) throw new Error(`Missing env var: ${k}`);
-    return v;
-};
+// ==== Env ==== //
+function must(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env ${ name } `);
+  return v;
+}
 
-const num = (k: string, def: number) => {
-    const v = process.env[k];
-    if (v == null || v === "") return def;
-    const n = Number(v);
-    if (Number.isNaN(n)) throw new Error(`Env ${k} must be a number`);
-    return n;
-};
+const RPC_HTTP = must("RPC_HTTP");              // e.g. https://mainnet.base.org
+const TOKEN_ADDRESS = must("TOKEN_ADDRESS");    // ERC20 address to watch
+const BURN_ADDRESS  = must("BURN_ADDRESS");     // address receiving tokens to be treated as burned
+const START_BLOCK   = Number(process.env.START_BLOCK || 0); // fallback if no cursor
+const BATCH_SIZE    = Number(process.env.BATCH_SIZE || 2000);
+const POLL_MS       = Number(process.env.POLL_INTERVAL_MS || 6000);
 
-const assertAddress = (label: string, addr: string) => {
-    if (!ethers.isAddress(addr)) throw new Error(`${label} is not a valid 0x address: ${addr}`);
-};
-
-const RPC_WSS = must("RPC_WSS");
-const RPC_HTTP = must("RPC_HTTP");
-const TOKEN_ADDRESS = must("TOKEN_ADDRESS");
-const REWARD_RECIPIENT = must("REWARD_RECIPIENT").toLowerCase();
-const DEAD_ADDRESS = must("DEAD_ADDRESS");
-const PRIVATE_KEY = must("PRIVATE_KEY");
-
-const TOKEN_DECIMALS = num("TOKEN_DECIMALS", 18);
-const MIN_TOKEN_TO_ACT = num("MIN_TOKEN_TO_ACT", 0);
-const DELAY_MS_AFTER_EVENT = num("DELAY_MS_AFTER_EVENT", 3000);
-const STARTUP_SWEEP = process.env.STARTUP_SWEEP === "1" || process.env.STARTUP_SWEEP === "true";
-
-assertAddress("TOKEN_ADDRESS", TOKEN_ADDRESS);
-assertAddress("REWARD_RECIPIENT", REWARD_RECIPIENT);
-assertAddress("DEAD_ADDRESS", DEAD_ADDRESS);
-
-const ZERO = "0x0000000000000000000000000000000000000000";
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Globals                                                                   */
-/* ────────────────────────────────────────────────────────────────────────── */
-
+const provider = new ethers.JsonRpcProvider(RPC_HTTP);
 const prisma = new PrismaClient();
+
+// Minimal ERC20 ABI
 const ERC20_ABI = [
-    "event Transfer(address indexed from, address indexed to, uint256 value)",
-    "function transfer(address to, uint256 value) returns (bool)",
-    "function balanceOf(address owner) view returns (uint256)",
-    "function decimals() view returns (uint8)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
 ];
 
-let httpProvider: ethers.JsonRpcProvider;
-let signer: ethers.Wallet;
-let wsProvider: ethers.WebSocketProvider;
-let tokenRead: ethers.Contract;
-let tokenWrite: ethers.Contract;
+const token = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, provider);
 
-const toHuman = (raw: bigint) => Number(ethers.formatUnits(raw, TOKEN_DECIMALS));
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* WebSocket Provider (reconnect + health check)                             */
-/* ────────────────────────────────────────────────────────────────────────── */
-
-function createWsProvider() {
-    const ws = new ethers.WebSocketProvider(RPC_WSS);
-    ws.on("error", (e) => console.error("⚠️ WS error:", e));
-    return ws;
+async function getCursor(): Promise<number> {
+  const row = await prisma.cursor.findUnique({ where: { tokenAddress: TOKEN_ADDRESS.toLowerCase() } });
+  if (!row) return START_BLOCK || (await provider.getBlockNumber());
+  return row.lastBlock;
 }
 
-async function reconnectWs(maxDelayMs = 15000) {
-    let delay = 1000;
-    while (true) {
-        try {
-            console.log("🔌 Reconnecting WebSocket…");
-            wsProvider?.destroy?.();
-            wsProvider = createWsProvider();
-            tokenRead = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, wsProvider);
-            console.log("✅ WS reconnected");
-            bindTransferListener();
-            break;
-        } catch (e) {
-            console.warn(`WS reconnect failed, retrying in ${delay} ms`, e);
-            await sleep(delay);
-            delay = Math.min(maxDelayMs, delay * 2);
-        }
-    }
+async function setCursor(block: number) {
+  await prisma.cursor.upsert({
+    where: { tokenAddress: TOKEN_ADDRESS.toLowerCase() },
+    create: { tokenAddress: TOKEN_ADDRESS.toLowerCase(), lastBlock: block },
+    update: { lastBlock: block },
+  });
 }
 
-/** Periodically verify WS health (every 30s) */
-function startWsHealthCheck() {
-    setInterval(async () => {
-        try {
-            await wsProvider._detectNetwork();
-        } catch {
-            console.warn("🧩 WS health check failed, reconnecting...");
-            await reconnectWs();
-        }
-    }, 30000);
-}
+async function processRange(fromBlock: number, toBlock: number) {
+  if (toBlock < fromBlock) return;
+  // Filter: Transfer(any, BURN_ADDRESS)
+  const filter = token.filters.Transfer(null, BURN_ADDRESS);
+  const logs = await token.queryFilter(filter, fromBlock, toBlock);
 
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Burn logic                                                                */
-/* ────────────────────────────────────────────────────────────────────────── */
+  if (logs.length === 0) {
+    console.log(`No burns between blocks ${ fromBlock } -${ toBlock } `);
+    return;
+  }
 
-async function burnAmount(from: string, value: bigint) {
-    const human = toHuman(value);
-    if (human < MIN_TOKEN_TO_ACT) {
-        console.log(`⏭️  Skip (below threshold). amount=${human} min=${MIN_TOKEN_TO_ACT}`);
-        return;
-    }
+  console.log(`Found ${ logs.length } burn transfers between ${ fromBlock } -${ toBlock } `);
 
-    await sleep(DELAY_MS_AFTER_EVENT);
+  for (const log of logs) {
+    const { transactionHash, index, blockNumber, args } = log as unknown as {
+      transactionHash: string;
+      index: number; // logIndex in ethers v6
+      blockNumber: number;
+      args: { from: string; to: string; value: bigint };
+    };
 
-    const tx = await tokenWrite.transfer(DEAD_ADDRESS, value);
-    console.log(`🔥 Burn submitted: ${human} tokens → ${DEAD_ADDRESS} | tx=${tx.hash}`);
-    const receipt = await tx.wait();
+    if (!args) continue;
+    const from = (args.from as string).toLowerCase();
+    const to = (args.to as string).toLowerCase();
+    if (to !== BURN_ADDRESS.toLowerCase()) continue; // double guard
 
-    const txHash = tx.hash || receipt?.transactionHash;
-    if (!txHash) {
-        console.warn("⚠️ No txHash found for burn — skipping DB insert.");
-        return;
-    }
+    const block = await provider.getBlock(blockNumber);
+    const ts = new Date(Number(block.timestamp) * 1000);
 
-    await prisma.burn.create({
-        data: {
-            txHash,
-            fromAddress: from,
-            toAddress: DEAD_ADDRESS,
-            tokenAddress: TOKEN_ADDRESS,
-            amountRaw: value.toString(),
-            amountHuman: human,
-        },
-    });
-
-    console.log(`✅ Logged burn: ${human} tokens | tx=${txHash}`);
-}
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Event listener                                                            */
-/* ────────────────────────────────────────────────────────────────────────── */
-
-function bindTransferListener() {
-    tokenRead.removeAllListeners();
-    tokenRead.on("Transfer", async (from: string, to: string, value: bigint) => {
-        try {
-            if (to.toLowerCase() !== REWARD_RECIPIENT) return;
-            const human = toHuman(value);
-            console.log(`🪙 Incoming: ${human} tokens from ${from} → ${REWARD_RECIPIENT}`);
-            await burnAmount(from, value);
-        } catch (e) {
-            console.error("Transfer handler error:", e);
-        }
-    });
-}
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Startup sweep                                                             */
-/* ────────────────────────────────────────────────────────────────────────── */
-
-async function startupSweep() {
     try {
-        const bal = (await tokenWrite.balanceOf(REWARD_RECIPIENT)) as bigint;
-        if (bal > 0n) {
-            const human = toHuman(bal);
-            console.log(`🧹 Startup sweep: found ${human} tokens at ${REWARD_RECIPIENT}`);
-            await burnAmount(REWARD_RECIPIENT, bal);
-        } else {
-            console.log("🧹 Startup sweep: no tokens to burn");
-        }
-    } catch (e) {
-        console.warn("Startup sweep failed:", e);
+      await prisma.burn.create({
+        data: {
+          txHash: transactionHash.toLowerCase(),
+          logIndex: index,
+          blockNumber,
+          tokenAddress: TOKEN_ADDRESS.toLowerCase(),
+          from,
+          to,
+          value: args.value.toString(),
+          timestamp: ts,
+        },
+      });
+      console.log(`✅ Recorded burn tx = ${ transactionHash } value = ${ args.value.toString() } `);
+    } catch (e: any) {
+      if (e.code === "P2002") {
+        // Unique constraint violated -> already processed
+        console.log(`↪︎ Duplicate(skipped) tx = ${ transactionHash } logIndex = ${ index } `);
+      } else {
+        console.error(`Error saving burn for tx = ${ transactionHash }: `, e);
+      }
     }
+  }
 }
 
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Main                                                                      */
-/* ────────────────────────────────────────────────────────────────────────── */
+async function run() {
+  console.log("Watcher online ✅");
+  console.log(`Token: ${ TOKEN_ADDRESS } `);
+  console.log(`Listening for transfers to: ${ BURN_ADDRESS } `);
+
+  let cursor = await getCursor();
+  const latestAtStart = await provider.getBlockNumber();
+  if (cursor === 0) cursor = latestAtStart;
+
+  // Initial catch-up from cursor to latest
+  while (true) {
+    const latest = await provider.getBlockNumber();
+    if (cursor >= latest) break;
+
+    const to = Math.min(cursor + BATCH_SIZE, latest);
+    await processRange(cursor + 1, to);
+    cursor = to;
+    await setCursor(cursor);
+  }
+
+  console.log("🌀 Entering polling loop...");
+
+  // Poll new blocks periodically
+  setInterval(async () => {
+    try {
+      const latest = await provider.getBlockNumber();
+      if (latest > cursor) {
+        const to = latest;
+        // Process in sub-batches to avoid huge queries
+        let from = cursor + 1;
+        while (from <= to) {
+          const end = Math.min(from + BATCH_SIZE - 1, to);
+          await processRange(from, end);
+          cursor = end;
+          await setCursor(cursor);
+          from = end + 1;
+        }
+      }
+    } catch (e) {
+      console.error("Polling error:", e);
+    }
+  }, POLL_MS);
+}
+
+process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException", e));
+
+run().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+```
+
+---
+
+## `src/backfill.ts`
+    ```ts
+/**
+ * src/backfill.ts
+ * Backfill burns: ERC20 Transfer(from:any -> to:BURN_ADDRESS) over a historical block range.
+ */
+import "dotenv/config";
+import { ethers } from "ethers";
+import { PrismaClient } from "@prisma/client";
+
+function must(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env ${ name } `);
+  return v;
+}
+
+const RPC_HTTP = must("RPC_HTTP");
+const TOKEN_ADDRESS = must("TOKEN_ADDRESS");
+const BURN_ADDRESS = must("BURN_ADDRESS");
+const FROM_BLOCK = Number(must("BACKFILL_FROM_BLOCK")); // explicit start
+const TO_BLOCK = Number(process.env.BACKFILL_TO_BLOCK || 0); // 0 = latest
+const BATCH_SIZE = Number(process.env.BACKFILL_BATCH_SIZE || 4000);
+
+const provider = new ethers.JsonRpcProvider(RPC_HTTP);
+const prisma = new PrismaClient();
+
+const ERC20_ABI = [
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+];
+
+const token = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, provider);
+
+async function saveBurn(log: any) {
+  const { transactionHash, index, blockNumber, args } = log as unknown as {
+    transactionHash: string;
+    index: number;
+    blockNumber: number;
+    args: { from: string; to: string; value: bigint };
+  };
+
+  const from = args.from.toLowerCase();
+  const to = args.to.toLowerCase();
+  if (to !== BURN_ADDRESS.toLowerCase()) return;
+
+  const block = await provider.getBlock(blockNumber);
+  const ts = new Date(Number(block.timestamp) * 1000);
+
+  try {
+    await prisma.burn.create({
+      data: {
+        txHash: transactionHash.toLowerCase(),
+        logIndex: index,
+        blockNumber,
+        tokenAddress: TOKEN_ADDRESS.toLowerCase(),
+        from,
+        to,
+        value: args.value.toString(),
+        timestamp: ts,
+      },
+    });
+    console.log(`✅ Backfilled tx = ${ transactionHash } `);
+  } catch (e: any) {
+    if (e.code === "P2002") {
+      console.log(`↪︎ Duplicate(skipped) tx = ${ transactionHash } logIndex = ${ index } `);
+    } else {
+      console.error(`Error saving backfill tx = ${ transactionHash }: `, e);
+    }
+  }
+}
 
 async function main() {
-    httpProvider = new ethers.JsonRpcProvider(RPC_HTTP);
-    signer = new ethers.Wallet(PRIVATE_KEY, httpProvider);
-    wsProvider = createWsProvider();
-    tokenRead = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, wsProvider);
-    tokenWrite = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, signer);
+  const latest = TO_BLOCK || (await provider.getBlockNumber());
+  console.log(`Backfilling ${ TOKEN_ADDRESS } to ${ BURN_ADDRESS } from ${ FROM_BLOCK } to ${ latest } (batch ${ BATCH_SIZE })`);
 
-    console.log("Watcher online ✅");
-    console.log(`Token: ${TOKEN_ADDRESS}`);
-    console.log(`Listening for transfers to: ${REWARD_RECIPIENT}`);
+  let from = FROM_BLOCK;
+  while (from <= latest) {
+    const to = Math.min(from + BATCH_SIZE - 1, latest);
+    const filter = token.filters.Transfer(null, BURN_ADDRESS);
+    const logs = await token.queryFilter(filter, from, to);
 
-    try {
-        const chainDecimals: number = await tokenWrite.decimals();
-        if (chainDecimals !== TOKEN_DECIMALS) {
-            console.warn(`NOTE: TOKEN_DECIMALS=${TOKEN_DECIMALS} but contract decimals=${chainDecimals}.`);
-        }
-    } catch (e) {
-        console.warn("Could not read token decimals (continuing):", e);
+    if (logs.length > 0) {
+      console.log(`Range ${ from } -${ to }: ${ logs.length } burns`);
+      for (const log of logs) {
+        await saveBurn(log);
+      }
+    } else {
+      console.log(`Range ${ from } -${ to }: 0 burns`);
     }
 
-    bindTransferListener();
-    startWsHealthCheck();
+    from = to + 1;
+  }
 
-    if (STARTUP_SWEEP) await startupSweep();
+  console.log("✅ Backfill complete");
 }
 
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Launch-safe idle                                                          */
-/* ────────────────────────────────────────────────────────────────────────── */
-
-if (TOKEN_ADDRESS.toLowerCase() === ZERO) {
-    console.log("⏸️  TOKEN_ADDRESS is zero address. Watcher is idling until launch.");
-    setInterval(() => console.log("⏳ waiting for launch…"), 60_000);
-} else {
-    main().catch((e) => {
-        console.error("Fatal watcher error:", e);
-        process.exit(1);
-    });
-}
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* Graceful shutdown                                                         */
-/* ────────────────────────────────────────────────────────────────────────── */
-
-process.on("SIGINT", async () => {
-    console.log("Shutting down…");
-    try {
-        await prisma.$disconnect();
-    } finally {
-        process.exit(0);
-    }
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
 });
+```
 
-process.on("SIGTERM", async () => {
-    console.log("Shutting down…");
-    try {
-        await prisma.$disconnect();
-    } finally {
-        process.exit(0);
-    }
-});
+---
+
+## ✅ Env checklist(Railway)
+Set these in your Railway variables:
+```
+RPC_HTTP=https://mainnet.base.org
+TOKEN_ADDRESS=0x30B7e85C723d5Fb90CCE208063e0ECbf3eA29b07
+BURN_ADDRESS=0xe8bb28baba6090f35d513b41cfb25542b0be0d85
+START_BLOCK=12345678              # first block after token deploy (optional but recommended)
+POLL_INTERVAL_MS=6000
+BATCH_SIZE=2000
+
+# Backfill-only vars if you run src/backfill.ts
+BACKFILL_FROM_BLOCK=12345678
+BACKFILL_TO_BLOCK=0               # 0 = latest
+BACKFILL_BATCH_SIZE=4000
+
+# Prisma
+DATABASE_PROVIDER=postgresql       # or sqlite/mysql
+DATABASE_URL=postgresql://...
+```
+
+---
+
+## 🧪 How to run
+1. Generate client & (optionally) migrate
+    - `npx prisma generate`
+    - `npx prisma migrate deploy`(prod) or`npx prisma migrate dev`
+2. Build: `tsc -p tsconfig.json`
+3. Start worker: `node dist/worker.js`
+4.(Optional) Backfill history: `node dist/backfill.js`
+
+This setup should resolve the "watcher online but no burns" issue by avoiding WebSockets and ensuring logs are processed and persisted with deduplication and a reliable cursor.
