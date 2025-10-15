@@ -40,13 +40,13 @@ assertAddress("TOKEN_ADDRESS", TOKEN_ADDRESS);
 assertAddress("REWARD_RECIPIENT", REWARD_RECIPIENT);
 assertAddress("DEAD_ADDRESS", DEAD_ADDRESS);
 
-const ZERO = "0x0000000000000000000000000000000000000000";
-
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Globals                                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 const prisma = new PrismaClient();
+
+// Include transfer/balanceOf to satisfy TS for ethers v6
 const ERC20_ABI = [
     "event Transfer(address indexed from, address indexed to, uint256 value)",
     "function balanceOf(address) view returns (uint256)",
@@ -56,23 +56,30 @@ const ERC20_ABI = [
 
 const providerHttp = new ethers.JsonRpcProvider(RPC_HTTP);
 const providerWs = new ethers.WebSocketProvider(RPC_WSS);
+
 const signer = new ethers.Wallet(PRIVATE_KEY, providerHttp);
+
+// Read-only contract (HTTP) and with signer for sending tx
 const contract = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, providerHttp);
-const contractSigner = contract.connect(signer);
+const contractSigner = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, signer);
+
+// Separate instance bound to WS for events (ethers v6)
+const contractWs = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, providerWs);
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Helpers                                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 async function burnBalance(reason: string) {
-    const bal = await contract.balanceOf(REWARD_RECIPIENT);
+    const bal = (await contract.balanceOf(REWARD_RECIPIENT)) as bigint;
     if (bal > 0n) {
         const human = Number(bal) / 10 ** TOKEN_DECIMALS;
         console.log(`🧹 ${reason}: burning ${human} tokens`);
+        // TS-safe call: contractSigner has transfer in ABI
         const tx = await contractSigner.transfer(DEAD_ADDRESS, bal);
         console.log(`→ TX: ${tx.hash}`);
-        await tx.wait();
-        console.log(`✅ Burned ${human} tokens`);
+        const rcpt = await tx.wait();
+        console.log(`✅ Burned ${human} tokens in block ${rcpt?.blockNumber}`);
     } else {
         console.log(`🧹 ${reason}: no tokens to burn`);
     }
@@ -92,23 +99,25 @@ async function main() {
         await burnBalance("Startup sweep");
     }
 
-    const iface = new ethers.Interface(ERC20_ABI);
-    const filter = contract.filters.Transfer(null, REWARD_RECIPIENT);
+    // In ethers v6, listen with the contract instance bound to WS
+    const filter = contractWs.filters.Transfer(null, REWARD_RECIPIENT);
 
-    providerWs.on(filter, async (from, to, value, event) => {
-        const human = Number(value) / 10 ** TOKEN_DECIMALS;
-        console.log(`📥 Transfer detected: ${human} tokens from ${from}`);
-        await new Promise((r) => setTimeout(r, DELAY_MS_AFTER_EVENT));
-        await burnBalance("Event-triggered burn");
+    contractWs.on(
+        filter,
+        async (from: string, to: string, value: bigint /*, event */) => {
+            const human = Number(value) / 10 ** TOKEN_DECIMALS;
+            console.log(`📥 Transfer detected: ${human} tokens from ${from}`);
+            await new Promise((r) => setTimeout(r, DELAY_MS_AFTER_EVENT));
+            await burnBalance("Event-triggered burn");
+        }
+    );
+
+    // If you want to observe low-level WS provider errors:
+    providerWs.on("error", (err) => {
+        console.error("WebSocket provider error:", err);
     });
-
-    providerWs._websocket.on("error", (err: any) => {
-        console.error("WebSocket error:", err);
-    });
-
-    providerWs._websocket.on("close", () => {
-        console.log("WebSocket closed. Attempting reconnect in 5s…");
-        setTimeout(main, 5000);
+    providerWs.on("close", () => {
+        console.warn("WebSocket provider closed");
     });
 }
 

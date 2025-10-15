@@ -1,9 +1,3 @@
-/**
- * src/backfill.ts
- * Backfill burns: ERC20 Transfer from REWARD_RECIPIENT -> DEAD_ADDRESS
- * Batches in 10-block windows for Alchemy free tier.
- */
-
 import "dotenv/config";
 import { ethers } from "ethers";
 import { Prisma, PrismaClient } from "@prisma/client";
@@ -22,9 +16,9 @@ const provider = new ethers.JsonRpcProvider(RPC_HTTP);
 const abi = ["event Transfer(address indexed from, address indexed to, uint256 value)"];
 const iface = new ethers.Interface(abi);
 
-// Start at token deployment block (you said 36,841,703)
+// Start at token deployment block (as in your original)
 const START_BLOCK = 36841703;
-// Alchemy free plan: 10-block eth_getLogs limit
+// Free-tier style windowing
 const STEP = 10;
 
 // Build a narrow topics filter so the node returns only relevant logs
@@ -58,22 +52,30 @@ async function main() {
             if (logs.length > 0) {
                 for (const log of logs) {
                     const parsed = iface.parseLog(log);
+                    if (!parsed) continue; // TS strict: guard null
+
                     const value = parsed.args.value as bigint;
                     const human = new Prisma.Decimal(value.toString()).div(
                         new Prisma.Decimal(10).pow(TOKEN_DECIMALS)
                     );
+
+                    const blk = await provider.getBlock(log.blockNumber);
+                    if (!blk) {
+                        console.warn(`Block ${log.blockNumber} not found; skipping ${log.transactionHash}`);
+                        continue;
+                    }
 
                     await prisma.burn.upsert({
                         where: { txHash: log.transactionHash },
                         update: {},
                         create: {
                             txHash: log.transactionHash,
-                            fromAddress: parsed.args.from.toLowerCase(),
-                            toAddress: parsed.args.to.toLowerCase(),
+                            fromAddress: (parsed.args.from as string).toLowerCase(),
+                            toAddress: (parsed.args.to as string).toLowerCase(),
                             tokenAddress: TOKEN_ADDRESS.toLowerCase(),
                             amountRaw: value.toString(),
                             amountHuman: human,
-                            timestamp: new Date((await provider.getBlock(log.blockNumber)).timestamp * 1000),
+                            timestamp: new Date(Number(blk.timestamp) * 1000),
                         },
                     });
 
