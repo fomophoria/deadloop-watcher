@@ -56,67 +56,43 @@ async function main() {
             });
 
             if (logs.length > 0) {
-                console.log(`📦 ${logs.length} burn logs from blocks ${fromBlock}–${toBlock}`);
-            }
+                for (const log of logs) {
+                    const parsed = iface.parseLog(log);
+                    const value = parsed.args.value as bigint;
+                    const human = new Prisma.Decimal(value.toString()).div(
+                        new Prisma.Decimal(10).pow(TOKEN_DECIMALS)
+                    );
 
-            for (const l of logs) {
-                // parseLog can throw or be incompatible at type-level; protect it.
-                let parsed: ReturnType<typeof iface.parseLog> | null = null;
-                try {
-                    parsed = iface.parseLog({ topics: l.topics, data: l.data });
-                } catch {
-                    // Not a matching log; skip defensively
-                    continue;
+                    await prisma.burn.upsert({
+                        where: { txHash: log.transactionHash },
+                        update: {},
+                        create: {
+                            txHash: log.transactionHash,
+                            fromAddress: parsed.args.from.toLowerCase(),
+                            toAddress: parsed.args.to.toLowerCase(),
+                            tokenAddress: TOKEN_ADDRESS.toLowerCase(),
+                            amountRaw: value.toString(),
+                            amountHuman: human,
+                            timestamp: new Date((await provider.getBlock(log.blockNumber)).timestamp * 1000),
+                        },
+                    });
+
+                    burnCount++;
+                    totalHuman = totalHuman.add(human);
                 }
-                if (!parsed) continue;
-
-                const args = parsed.args as unknown as { from: string; to: string; value: bigint };
-                const from = args.from.toLowerCase();
-                const to = args.to.toLowerCase();
-                const value = args.value;
-
-                // Double-check the pair (defensive)
-                if (from !== REWARD_RECIPIENT || to !== DEAD_ADDRESS) continue;
-
-                const humanStr = ethers.formatUnits(value, TOKEN_DECIMALS); // string
-                const amountHuman = new Prisma.Decimal(humanStr);
-
-                burnCount += 1;
-                totalHuman = totalHuman.add(amountHuman);
-
-                console.log(
-                    `🔥 Burn found: ${humanStr} tokens — ${from} → ${to} | tx=${l.transactionHash}`
-                );
-
-                await prisma.burn.upsert({
-                    where: { txHash: l.transactionHash },
-                    update: {},
-                    create: {
-                        txHash: l.transactionHash,
-                        fromAddress: from,
-                        toAddress: to,
-                        tokenAddress: TOKEN_ADDRESS,
-                        amountRaw: value.toString(),
-                        amountHuman, // Decimal (exact)
-                    },
-                });
             }
         } catch (err) {
-            const msg = (err as Error)?.message ?? String(err);
-            console.error(`⚠️  Error fetching ${fromBlock}–${toBlock}: ${msg}`);
-            // brief cooldown to avoid provider throttling
-            await new Promise((r) => setTimeout(r, 1000));
+            console.error(`Error at block range ${fromBlock}-${toBlock}`, err);
         }
     }
 
-    console.log("Backfill complete ✅");
-    console.log(`🔥 Total burns recorded: ${burnCount}`);
-    console.log(`💰 Total tokens burned: ${totalHuman.toString()} units`);
-
-    await prisma.$disconnect();
+    console.log(`✅ Done. ${burnCount} burns, total ${totalHuman.toString()} tokens.`);
 }
 
-main().catch(async (err) => {
-    console.error("Fatal error in backfill:", err);
-    await prisma.$disconnect();
-});
+main()
+    .catch((err) => {
+        console.error(err);
+    })
+    .finally(async () => {
+        await prisma.$disconnect();
+    });

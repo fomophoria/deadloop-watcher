@@ -1,30 +1,21 @@
-// ----------------------------
-// Prisma Client configuration
-// ----------------------------
 generator client {
   provider = "prisma-client-js"
 }
 
-// ----------------------------
-// Database connection
-// ----------------------------
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// ----------------------------
-// Models
-// ----------------------------
 model Burn {
   id           Int      @id @default(autoincrement())
-  txHash       String   @unique                       // on-chain tx hash
-  fromAddress  String?                               // source wallet
-  toAddress    String?                               // destination (burn/dead) wallet
-  tokenAddress String?                               // token contract
-  amountRaw    String?                               // raw units (bigints as text)
-  amountHuman  Decimal?                              // exact human-readable amount
-  timestamp    DateTime @default(now())              // when burn happened
+  txHash       String   @unique
+  fromAddress  String?
+  toAddress    String?
+  tokenAddress String?
+  amountRaw    String?
+  amountHuman  Decimal?
+  timestamp    DateTime @default(now())
 
   @@index([timestamp])
   @@index([tokenAddress])
